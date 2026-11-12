@@ -1,301 +1,339 @@
 import asyncio
 import os
-import random
 import re
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
+
+import anthropic
+import openai
 import tiktoken
 from dotenv import load_dotenv
-
-# Provider SDKs & Errors
 from google import genai
-from google.genai import types
-from google.genai.errors import APIError as GoogleAPIError
-from openai import (
-    AsyncOpenAI,
-    AuthenticationError as OpenAIAuthError,
-    RateLimitError as OpenAIRateLimit,
-    APIStatusError as OpenAIStatusError,
-)
-from anthropic import (
-    AsyncAnthropic,
-    AuthenticationError as AnthropicAuthError,
-    RateLimitError as AnthropicRateLimit,
-    APIStatusError as AnthropicStatusError,
-)
+from google.genai import errors as genai_errors
 
-from src.schemas import StreamChunk, ChunkTelemetry, GatewayError, AuthenticationError, RateLimitError
-from src.pricing import calculate_cost
+from src.pricing import PRICING_TABLE, calculate_cost_usd
+from src.schemas import ChunkTelemetry, StreamChunk
 
-load_dotenv(override=False)
-
-# ------------------------------------------------------------------------------
-# Model Fallback Directory
-# Automatically reroutes traffic when preview endpoints experience demand spikes
-# ------------------------------------------------------------------------------
-FALLBACK_MODELS: dict[str, str] = {
-    "gemini-3.8-flash": "gemini-2.0-flash",
-    "gemini-2.0-flash": "gemini-1.5-flash",
-}
+# Explicitly load .env from project root without relying on stack-frame inspection
+load_dotenv(".env", override=True)
 
 
-def sanitize_message(msg: str) -> str:
-    """Masks secret API keys to prevent credential leakage in logs or exceptions."""
-    sanitized = re.sub(r'(sk-[a-zA-Z0-9_\-]{20,})', '[REDACTED_KEY]', str(msg))
-    sanitized = re.sub(r'(AIzaSy[a-zA-Z0-9_\-]{33})', '[REDACTED_GEMINI_KEY]', sanitized)
-    sanitized = re.sub(r'x-api-key:[a-zA-Z0-9_\-]+', 'x-api-key:[REDACTED_KEY]', sanitized)
+class GatewayError(Exception):
+    """Base exception for LLM Gateway errors."""
+
+
+class AuthenticationError(GatewayError):
+    """Raised when provider API credentials are missing or invalid."""
+
+
+class RateLimitExceededError(GatewayError):
+    """Raised when provider rate limits are exceeded."""
+
+
+class GatewayProviderError(GatewayError):
+    """Raised on upstream provider connection or API failures."""
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Strips OpenAI/Anthropic (sk-...) and Google (AIza... / AQ....) keys from strings."""
+    sanitized = re.sub(r"sk-[a-zA-Z0-9_\-]+", "[REDACTED_API_KEY]", str(message))
+    sanitized = re.sub(r"AIza[0-9A-Za-z\-_]{35}", "[REDACTED_API_KEY]", sanitized)
+    sanitized = re.sub(r"AQ\.[0-9A-Za-z\-_]+", "[REDACTED_API_KEY]", sanitized)
     return sanitized
 
 
-def is_transient_error(err: Exception) -> bool:
-    """Detects HTTP 429 (rate limits) and HTTP 503 (server demand spikes)."""
-    if isinstance(err, GoogleAPIError):
-        code = getattr(err, "code", None)
-        if code in (429, 503):
-            return True
-
-    if isinstance(err, (OpenAIRateLimit, AnthropicRateLimit)):
-        return True
-
-    if isinstance(err, (OpenAIStatusError, AnthropicStatusError)):
-        if err.status_code in (429, 500, 502, 503):
-            return True
-
-    err_str = str(err).lower()
-    return any(marker in err_str for marker in ("503", "unavailable", "high demand", "429", "rate limit"))
-
-
 class UnifiedLLMGateway:
-    """Multi-provider streaming gateway with automatic retry and model fallback."""
+    """Async multi-provider LLM gateway with persistent clients and real-time telemetry."""
 
     def __init__(
         self,
-        gemini_api_key: str | None = None,
-        openai_api_key: str | None = None,
-        anthropic_api_key: str | None = None,
-        max_retries: int = 2,
-        base_delay: float = 1.0,
-        max_delay: float = 8.0,
-    ):
-        self.gemini_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
-        self.openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        self.anthropic_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        openai_api_key: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
+    ) -> None:
+        self._openai_key = (
+            openai_api_key if openai_api_key is not None else os.getenv("OPENAI_API_KEY", "")
+        ).strip()
+        self._anthropic_key = (
+            anthropic_api_key if anthropic_api_key is not None else os.getenv("ANTHROPIC_API_KEY", "")
+        ).strip()
+        self._gemini_key = (
+            gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")
+        ).strip()
 
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.max_delay = max_delay
+        # Prevent stale OS variables from hijacking google-genai auth
+        os.environ.pop("GOOGLE_API_KEY", None)
+        os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
 
-        # Persistent connection-pooled client singletons
-        self._gemini_client: genai.Client | None = None
-        self._openai_client: AsyncOpenAI | None = None
-        self._anthropic_client: AsyncAnthropic | None = None
+        # Persistent async clients for connection pooling
+        self._openai_client: Optional[openai.AsyncOpenAI] = (
+            openai.AsyncOpenAI(api_key=self._openai_key) if self._openai_key else None
+        )
+        self._anthropic_client: Optional[anthropic.AsyncAnthropic] = (
+            anthropic.AsyncAnthropic(api_key=self._anthropic_key) if self._anthropic_key else None
+        )
+        self._gemini_client: Optional[genai.Client] = (
+            genai.Client(
+                api_key=self._gemini_key,
+                vertexai=False,
+                http_options={"headers": {"x-goog-api-key": self._gemini_key}},
+            )
+            if self._gemini_key
+            else None
+        )
 
-    @property
-    def gemini_client(self) -> genai.Client:
-        if not self.gemini_key:
-            raise AuthenticationError("GEMINI_API_KEY is not configured or missing.")
-        if self._gemini_client is None:
-            self._gemini_client = genai.Client(api_key=self.gemini_key)
-        return self._gemini_client
-
-    @property
-    def openai_client(self) -> AsyncOpenAI:
-        if not self.openai_key:
-            raise AuthenticationError("OPENAI_API_KEY is not configured or missing.")
-        if self._openai_client is None:
-            self._openai_client = AsyncOpenAI(api_key=self.openai_key)
-        return self._openai_client
-
-    @property
-    def anthropic_client(self) -> AsyncAnthropic:
-        if not self.anthropic_key:
-            raise AuthenticationError("ANTHROPIC_API_KEY is not configured or missing.")
-        if self._anthropic_client is None:
-            self._anthropic_client = AsyncAnthropic(api_key=self.anthropic_key)
-        return self._anthropic_client
-
-    def count_prompt_tokens(self, text: str, model: str) -> int:
-        """Deterministic prompt token counting via tiktoken."""
+    def count_tokens_local(self, text: str, model: str = "gpt-4o") -> int:
+        """Deterministic local token count using tiktoken with an offline fallback."""
         try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-        return len(encoding.encode(text))
+            try:
+                encoding = tiktoken.encoding_for_model(model)
+            except KeyError:
+                encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            # Offline fallback when openaipublic.blob.core.windows.net is unreachable
+            words = text.split()
+            return max(1, len(words)) if words else 0
+
+    def _validate_credentials(self, provider: str) -> None:
+        if provider == "openai":
+            if not self._openai_key or not self._openai_key.startswith("sk-") or self._openai_client is None:
+                raise AuthenticationError(
+                    "OpenAI API key is missing or malformed. Set a valid OPENAI_API_KEY starting with 'sk-'."
+                )
+        elif provider == "anthropic":
+            if (
+                not self._anthropic_key
+                or not self._anthropic_key.startswith("sk-ant-")
+                or self._anthropic_client is None
+            ):
+                raise AuthenticationError(
+                    "Anthropic API key is missing or malformed. Set a valid ANTHROPIC_API_KEY starting with 'sk-ant-'."
+                )
+        elif provider == "gemini":
+            if (
+                not self._gemini_key
+                or not self._gemini_key.startswith(("AIza", "AQ."))
+                or self._gemini_client is None
+            ):
+                raise AuthenticationError(
+                    "Gemini API key is missing or malformed. Set a valid GEMINI_API_KEY starting with 'AIza' or 'AQ.'."
+                )
+
+    def _build_final_chunk(
+        self,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        start_time: float,
+        first_token_time: Optional[float],
+    ) -> StreamChunk:
+        end_time = time.perf_counter()
+        total_latency = max(end_time - start_time, 1e-6)
+        ttft_ms = max(round(((first_token_time or end_time) - start_time) * 1000, 2), 0.01)
+        tps = round(output_tokens / total_latency, 2)
+        cost = calculate_cost_usd(model, input_tokens, output_tokens)
+
+        return StreamChunk(
+            delta_text="",
+            provider=provider,  # type: ignore[arg-type]
+            model=model,
+            is_final=True,
+            telemetry=ChunkTelemetry(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                ttft_ms=ttft_ms,
+                total_latency_s=round(total_latency, 4),
+                tokens_per_second=tps,
+                total_cost_usd=cost,
+            ),
+        )
 
     async def stream(
-        self, prompt: str, model: str, temperature: float = 0.7
+        self,
+        prompt: str,
+        model: str,
+        temperature: float = 0.7,
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Streams normalized chunks, handling retries and fallback before first yield."""
-        provider = "gemini" if "gemini" in model else ("openai" if ("gpt" in model or "o1" in model) else "anthropic")
+        if model not in PRICING_TABLE:
+            raise GatewayProviderError(f"Model '{model}' is not supported.")
 
-        for attempt in range(self.max_retries + 1):
-            start_time = time.perf_counter()
-            first_token_time: float | None = None
-            accumulated_text = ""
-            prompt_tokens = 0
-            completion_tokens = 0
-            yielded_any_chunk = False
+        provider = PRICING_TABLE[model]["provider"]
+        self._validate_credentials(provider)
 
-            try:
-                # -------------------------------------------------------------
-                # 1. Google Gemini Branch
-                # -------------------------------------------------------------
-                if provider == "gemini":
-                    client = self.gemini_client
-                    prompt_tokens = self.count_prompt_tokens(prompt, model)
-                    config = types.GenerateContentConfig(temperature=temperature)
+        if provider == "openai":
+            async for chunk in self._stream_openai(prompt, model, temperature):
+                yield chunk
+        elif provider == "anthropic":
+            async for chunk in self._stream_anthropic(prompt, model, temperature):
+                yield chunk
+        elif provider == "gemini":
+            async for chunk in self._stream_gemini(prompt, model, temperature):
+                yield chunk
 
-                    response = await client.aio.models.generate_content_stream(
+    async def _stream_openai(
+        self, prompt: str, model: str, temperature: float
+    ) -> AsyncGenerator[StreamChunk, None]:
+        start_time = time.perf_counter()
+        first_token_time: Optional[float] = None
+        input_tokens = self.count_tokens_local(prompt, model)
+        output_tokens = 0
+
+        try:
+            response_stream = await self._openai_client.chat.completions.create(  # type: ignore[union-attr]
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            async for chunk in response_stream:
+                if not chunk.choices:
+                    if chunk.usage:
+                        input_tokens = chunk.usage.prompt_tokens
+                        output_tokens = chunk.usage.completion_tokens
+                    continue
+
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter()
+                    yield StreamChunk(
+                        delta_text=delta,
+                        provider="openai",
                         model=model,
-                        contents=prompt,
-                        config=config,
+                        is_final=False,
                     )
 
-                    async for chunk in response:
-                        if chunk.usage_metadata:
-                            prompt_tokens = chunk.usage_metadata.prompt_token_count or prompt_tokens
-                            completion_tokens = chunk.usage_metadata.candidates_token_count or completion_tokens
+        except openai.AuthenticationError as exc:
+            raise AuthenticationError(
+                f"OpenAI authentication failed: {_sanitize_error_message(str(exc))}"
+            ) from None
+        except openai.RateLimitError as exc:
+            raise RateLimitExceededError(
+                f"OpenAI rate limit exceeded: {_sanitize_error_message(str(exc))}"
+            ) from None
+        except openai.APIError as exc:
+            raise GatewayProviderError(
+                f"OpenAI upstream error: {_sanitize_error_message(str(exc))}"
+            ) from None
 
-                        delta = chunk.text or ""
-                        if delta:
+        yield self._build_final_chunk(
+            "openai", model, input_tokens, output_tokens, start_time, first_token_time
+        )
+
+    async def _stream_anthropic(
+        self, prompt: str, model: str, temperature: float
+    ) -> AsyncGenerator[StreamChunk, None]:
+        start_time = time.perf_counter()
+        first_token_time: Optional[float] = None
+        input_tokens = self.count_tokens_local(prompt)
+        output_tokens = 0
+
+        try:
+            async with self._anthropic_client.messages.stream(  # type: ignore[union-attr]
+                model=model,
+                max_tokens=1024,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                async for event in stream:
+                    if event.type == "message_start":
+                        input_tokens = event.message.usage.input_tokens
+                    elif event.type == "content_block_delta":
+                        if hasattr(event.delta, "text") and event.delta.text:
                             if first_token_time is None:
                                 first_token_time = time.perf_counter()
-                            accumulated_text += delta
-                            yielded_any_chunk = True
                             yield StreamChunk(
-                                delta_text=delta,
-                                provider="gemini",
+                                delta_text=event.delta.text,
+                                provider="anthropic",
                                 model=model,
                                 is_final=False,
                             )
+                    elif event.type == "message_delta":
+                        if hasattr(event, "usage") and event.usage:
+                            output_tokens = event.usage.output_tokens
 
-                # -------------------------------------------------------------
-                # 2. OpenAI Branch
-                # -------------------------------------------------------------
-                elif provider == "openai":
-                    client = self.openai_client
-                    prompt_tokens = self.count_prompt_tokens(prompt, model)
+        except anthropic.AuthenticationError as exc:
+            raise AuthenticationError(
+                f"Anthropic authentication failed: {_sanitize_error_message(str(exc))}"
+            ) from None
+        except anthropic.RateLimitError as exc:
+            raise RateLimitExceededError(
+                f"Anthropic rate limit exceeded: {_sanitize_error_message(str(exc))}"
+            ) from None
+        except anthropic.APIError as exc:
+            raise GatewayProviderError(
+                f"Anthropic upstream error: {_sanitize_error_message(str(exc))}"
+            ) from None
 
-                    response = await client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=temperature,
-                        stream=True,
-                        stream_options={"include_usage": True},
-                    )
+        yield self._build_final_chunk(
+            "anthropic", model, input_tokens, output_tokens, start_time, first_token_time
+        )
 
-                    async for chunk in response:
-                        if chunk.usage is not None:
-                            prompt_tokens = chunk.usage.prompt_tokens or prompt_tokens
-                            completion_tokens = chunk.usage.completion_tokens or completion_tokens
+    async def _stream_gemini(
+        self, prompt: str, model: str, temperature: float
+    ) -> AsyncGenerator[StreamChunk, None]:
+        start_time = time.perf_counter()
+        first_token_time: Optional[float] = None
+        input_tokens = self.count_tokens_local(prompt)
+        output_tokens = 0
 
-                        if chunk.choices and len(chunk.choices) > 0:
-                            delta = chunk.choices[0].delta.content or ""
-                            if delta:
-                                if first_token_time is None:
-                                    first_token_time = time.perf_counter()
-                                accumulated_text += delta
-                                yielded_any_chunk = True
-                                yield StreamChunk(
-                                    delta_text=delta,
-                                    provider="openai",
-                                    model=model,
-                                    is_final=False,
-                                )
+        max_retries = 3
+        base_delay = 1.0
 
-                # -------------------------------------------------------------
-                # 3. Anthropic Branch
-                # -------------------------------------------------------------
-                elif provider == "anthropic":
-                    client = self.anthropic_client
-                    async with client.messages.stream(
-                        model=model,
-                        max_tokens=2048,
-                        temperature=temperature,
-                        messages=[{"role": "user", "content": prompt}],
-                    ) as stream_ctx:
-                        async for event in stream_ctx:
-                            if event.type == "message_start":
-                                prompt_tokens = event.message.usage.input_tokens
-                            elif event.type == "content_block_delta":
-                                delta = event.delta.text
-                                if delta:
-                                    if first_token_time is None:
-                                        first_token_time = time.perf_counter()
-                                    accumulated_text += delta
-                                    yielded_any_chunk = True
-                                    yield StreamChunk(
-                                        delta_text=delta,
-                                        provider="anthropic",
-                                        model=model,
-                                        is_final=False,
-                                    )
-                            elif event.type == "message_delta":
-                                if hasattr(event.usage, "output_tokens") and event.usage.output_tokens:
-                                    completion_tokens = event.usage.output_tokens
-
-                # -------------------------------------------------------------
-                # Terminal Telemetry Receipt
-                # -------------------------------------------------------------
-                end_time = time.perf_counter()
-                total_duration = end_time - start_time
-                ttft_ms = ((first_token_time - start_time) * 1000.0) if first_token_time else 0.0
-
-                if completion_tokens == 0:
-                    completion_tokens = self.count_prompt_tokens(accumulated_text, model)
-
-                gen_window = (end_time - first_token_time) if first_token_time else total_duration
-                tps = (completion_tokens / gen_window) if gen_window > 0 else 0.0
-                cost = calculate_cost(model, prompt_tokens, completion_tokens)
-
-                final_telemetry = ChunkTelemetry(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                    ttft_ms=round(ttft_ms, 2),
-                    total_time_sec=round(total_duration, 3),
-                    tokens_per_second=round(tps, 2),
-                    total_cost_usd=cost,
-                )
-
-                yield StreamChunk(
-                    delta_text="",
-                    provider=provider,
+        for attempt in range(max_retries):
+            try:
+                response_stream = await self._gemini_client.aio.models.generate_content_stream(  # type: ignore[union-attr]
                     model=model,
-                    is_final=True,
-                    telemetry=final_telemetry,
+                    contents=prompt,
+                    config={"temperature": temperature},
                 )
-                return  # Stream completed cleanly
 
-            except Exception as err:
-                # Mid-stream error: cannot retry or fallback without duplicating output
-                if yielded_any_chunk:
-                    raise GatewayError(sanitize_message(f"Stream interrupted mid-generation: {err}")) from err
+                async for chunk in response_stream:
+                    text_delta = getattr(chunk, "text", None)
+                    if text_delta:
+                        if first_token_time is None:
+                            first_token_time = time.perf_counter()
+                        yield StreamChunk(
+                            delta_text=text_delta,
+                            provider="gemini",
+                            model=model,
+                            is_final=False,
+                        )
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage:
+                        if getattr(usage, "prompt_token_count", None):
+                            input_tokens = usage.prompt_token_count
+                        if getattr(usage, "candidates_token_count", None):
+                            output_tokens = usage.candidates_token_count
 
-                # Case A: Retry with exponential backoff on current model
-                if is_transient_error(err) and attempt < self.max_retries:
-                    delay = min(self.base_delay * (2 ** attempt) + random.uniform(0.1, 0.4), self.max_delay)
-                    await asyncio.sleep(delay)
+                break
+
+            except genai_errors.APIError as exc:
+                if exc.code in (401, 403):
+                    raise AuthenticationError(
+                        f"Gemini authentication failed: {_sanitize_error_message(str(exc))}"
+                    ) from None
+                if exc.code == 429:
+                    raise RateLimitExceededError(
+                        f"Gemini rate limit exceeded: {_sanitize_error_message(str(exc))}"
+                    ) from None
+                if exc.code == 503 and first_token_time is None and attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2**attempt))
                     continue
+                raise GatewayProviderError(
+                    f"Gemini upstream error: {_sanitize_error_message(str(exc))}"
+                ) from None
 
-                # Case B: Retries exhausted -> Cascade to fallback model
-                if is_transient_error(err):
-                    fallback_model = FALLBACK_MODELS.get(model)
-                    if fallback_model and fallback_model != model:
-                        async for fallback_chunk in self.stream(
-                            prompt=prompt,
-                            model=fallback_model,
-                            temperature=temperature,
-                        ):
-                            yield fallback_chunk
-                        return
+        yield self._build_final_chunk(
+            "gemini", model, input_tokens, output_tokens, start_time, first_token_time
+        )
 
-                # Case C: Permanent errors or exhausted fallbacks
-                if isinstance(err, (OpenAIAuthError, AnthropicAuthError)):
-                    raise AuthenticationError(sanitize_message(f"Authentication failed: {err}")) from err
-                elif isinstance(err, GoogleAPIError) and getattr(err, "code", None) in (401, 403):
-                    raise AuthenticationError(sanitize_message(f"Gemini authentication failed: {err}")) from err
-                elif is_transient_error(err):
-                    raise RateLimitError(sanitize_message(f"Capacity exhausted after retries and fallback: {err}")) from err
-                else:
-                    raise GatewayError(sanitize_message(f"Gateway execution error: {err}")) from err
+    async def close(self) -> None:
+        if self._openai_client:
+            await self._openai_client.close()
+        if self._anthropic_client:
+            await self._anthropic_client.close()

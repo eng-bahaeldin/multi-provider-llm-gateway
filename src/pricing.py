@@ -1,50 +1,58 @@
-from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal, TypedDict
+
+
+class ModelPricing(TypedDict):
+    provider: Literal["openai", "anthropic", "gemini"]
+    input_per_million: float
+    output_per_million: float
+
 
 # Pricing in USD per 1,000,000 tokens
-MODEL_PRICING: dict[str, dict[str, float]] = {
-    # Google Gemini Models
+PRICING_TABLE: dict[str, ModelPricing] = {
+    "gemini-3.5-flash-lite": {
+        "provider": "gemini",
+        "input_per_million": 0.30,
+        "output_per_million": 2.50,
+    },
+    "gemini-3.1-flash-lite": {
+        "provider": "gemini",
+        "input_per_million": 0.25,
+        "output_per_million": 1.50,
+    },
     "gemini-3.8-flash": {
-        "input": 0.15,
-        "output": 0.60,
+        "provider": "gemini",
+        "input_per_million": 0.75,
+        "output_per_million": 3.75,
     },
-    "gemini-3.8-pro": {
-        "input": 1.25,
-        "output": 5.00,
-    },
-    # OpenAI Models
     "gpt-4o-mini": {
-        "input": 0.15,
-        "output": 0.60,
+        "provider": "openai",
+        "input_per_million": 0.15,
+        "output_per_million": 0.60,
     },
     "gpt-4o": {
-        "input": 2.50,
-        "output": 10.00,
+        "provider": "openai",
+        "input_per_million": 2.50,
+        "output_per_million": 10.00,
     },
-    # Anthropic Models
-    "claude-3-5-haiku-20241022": {
-        "input": 0.80,
-        "output": 4.00,
+    "claude-3-5-sonnet-latest": {
+        "provider": "anthropic",
+        "input_per_million": 3.00,
+        "output_per_million": 15.00,
     },
-    "claude-3-5-sonnet-20241022": {
-        "input": 3.00,
-        "output": 15.00,
+    "claude-3-5-haiku-latest": {
+        "provider": "anthropic",
+        "input_per_million": 0.80,
+        "output_per_million": 4.00,
     },
 }
 
 
-def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """
-    Computes total execution cost down to micro-cents ($0.000001) using Decimal
-    arithmetic to eliminate floating-point rounding drift.
-    """
-    rates = MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
-    million = Decimal("1000000")
+def calculate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Calculates execution cost in USD rounded to 6 decimal places (micro-cents)."""
+    pricing = PRICING_TABLE.get(model)
+    if not pricing:
+        raise ValueError(f"Unsupported model for pricing calculation: {model}")
 
-    input_rate = Decimal(str(rates["input"]))
-    output_rate = Decimal(str(rates["output"]))
-
-    input_cost = (Decimal(prompt_tokens) / million) * input_rate
-    output_cost = (Decimal(completion_tokens) / million) * output_rate
-    total = input_cost + output_cost
-
-    return float(total.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP))
+    input_cost = (input_tokens / 1_000_000) * pricing["input_per_million"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output_per_million"]
+    return round(input_cost + output_cost, 6)
