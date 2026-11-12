@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
+import inspect
 import asyncio
 import traceback
 import streamlit as st
@@ -18,13 +18,6 @@ st.set_page_config(page_title="Multi-Provider LLM Gateway", layout="wide")
 st.title("Multi-Provider Async LLM Gateway & Telemetry Engine")
 st.caption("Unified streaming abstraction across OpenAI, Anthropic, and Google Gemini")
 
-
-@st.cache_resource
-def get_gateway() -> UnifiedLLMGateway:
-    return UnifiedLLMGateway()
-
-
-gateway = get_gateway()
 
 with st.sidebar:
     st.header("Model Configuration")
@@ -63,27 +56,63 @@ if st.button("Stream Response", type="primary"):
         output_box = st.empty()
         output_box.info(f"Connecting to {provider} (`{model}`)...")
 
+
         async def run_stream() -> None:
+            # Create a fresh gateway inside the running event loop
+            local_gateway = UnifiedLLMGateway()
+
             accumulated_text = ""
             final_telemetry: ChunkTelemetry | None = None
 
-            async for chunk in gateway.stream(prompt=prompt, model=model, temperature=temperature):
-                if chunk.delta_text:
-                    accumulated_text += chunk.delta_text
-                    output_box.markdown(accumulated_text + "▌")
-                if chunk.is_final and chunk.telemetry:
-                    final_telemetry = chunk.telemetry
+            try:
+                async for chunk in local_gateway.stream(
+                        prompt=prompt,
+                        model=model,
+                        temperature=temperature
+                ):
+                    if chunk.delta_text:
+                        accumulated_text += chunk.delta_text
+                        output_box.markdown(accumulated_text + "▌")
 
-            output_box.markdown(accumulated_text)
+                    if chunk.is_final and chunk.telemetry:
+                        final_telemetry = chunk.telemetry
 
-            if final_telemetry:
-                ttft_metric.metric("TTFT (Time to First Token)", f"{final_telemetry.ttft_ms:.2f} ms")
-                tps_metric.metric("Throughput", f"{final_telemetry.tokens_per_second:.2f} tok/s")
-                tokens_metric.metric(
-                    "Tokens (In / Out)",
-                    f"{final_telemetry.input_tokens} / {final_telemetry.output_tokens}",
+                output_box.markdown(accumulated_text)
+
+                if final_telemetry:
+                    ttft_metric.metric(
+                        "TTFT (Time to First Token)",
+                        f"{final_telemetry.ttft_ms:.2f} ms"
+                    )
+
+                    tps_metric.metric(
+                        "Throughput",
+                        f"{final_telemetry.tokens_per_second:.2f} tok/s"
+                    )
+
+                    tokens_metric.metric(
+                        "Tokens (In / Out)",
+                        f"{final_telemetry.input_tokens} / "
+                        f"{final_telemetry.output_tokens}"
+                    )
+
+                    cost_metric.metric(
+                        "Execution Cost",
+                        f"${final_telemetry.total_cost_usd:.6f}"
+                    )
+
+            finally:
+                # Close asynchronous resources if the gateway supports cleanup.
+                close_method = (
+                        getattr(local_gateway, "aclose", None)
+                        or getattr(local_gateway, "close", None)
                 )
-                cost_metric.metric("Execution Cost", f"${final_telemetry.total_cost_usd:.6f}")
+
+                if callable(close_method):
+                    result = close_method()
+
+                    if inspect.isawaitable(result):
+                        await result
 
         try:
             asyncio.run(run_stream())
