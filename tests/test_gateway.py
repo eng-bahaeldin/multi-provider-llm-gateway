@@ -117,4 +117,4 @@ async def test_telemetry_sanity():
     assert final_chunk.telemetry is not None
     assert final_chunk.telemetry.total_cost_usd > 0
     assert final_chunk.telemetry.tokens_per_second > 0
-    assert final_chunk.telemetry.ttft_ms > 0
+    assert final_chunk.telemetry.time_to_first_token_ms > 0

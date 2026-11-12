@@ -1,58 +1,31 @@
-from typing import Literal, TypedDict
+"""src/pricing.py - Model pricing tables and deterministic micro-cent cost calculation."""
 
+from typing import Dict, Tuple
 
-class ModelPricing(TypedDict):
-    provider: Literal["openai", "anthropic", "gemini"]
-    input_per_million: float
-    output_per_million: float
-
-
-# Pricing in USD per 1,000,000 tokens
-PRICING_TABLE: dict[str, ModelPricing] = {
-    "gemini-3.5-flash-lite": {
-        "provider": "gemini",
-        "input_per_million": 0.30,
-        "output_per_million": 2.50,
-    },
-    "gemini-3.1-flash-lite": {
-        "provider": "gemini",
-        "input_per_million": 0.25,
-        "output_per_million": 1.50,
-    },
-    "gemini-3.8-flash": {
-        "provider": "gemini",
-        "input_per_million": 0.75,
-        "output_per_million": 3.75,
-    },
-    "gpt-4o-mini": {
-        "provider": "openai",
-        "input_per_million": 0.15,
-        "output_per_million": 0.60,
-    },
-    "gpt-4o": {
-        "provider": "openai",
-        "input_per_million": 2.50,
-        "output_per_million": 10.00,
-    },
-    "claude-3-5-sonnet-latest": {
-        "provider": "anthropic",
-        "input_per_million": 3.00,
-        "output_per_million": 15.00,
-    },
-    "claude-3-5-haiku-latest": {
-        "provider": "anthropic",
-        "input_per_million": 0.80,
-        "output_per_million": 4.00,
-    },
+PRICING_TABLE_PER_1M: Dict[str, Tuple[float, float]] = {
+    # Google Gemini
+    "gemini-3.8-flash": (0.10, 0.40),
+    "gemini-3.8-pro": (1.25, 5.00),
+    "gemini-3.5-flash": (0.10, 0.40),
+    "gemini-3.5-pro": (1.25, 5.00),
+    # OpenAI
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    # Anthropic
+    "claude-3-5-sonnet-20241022": (3.00, 15.00),
+    "claude-3-5-haiku-20241022": (1.00, 5.00),
+    "claude-3-5-sonnet-latest": (3.00, 15.00),
+    "claude-3-5-haiku-latest": (1.00, 5.00),
 }
 
 
-def calculate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculates execution cost in USD rounded to 6 decimal places (micro-cents)."""
-    pricing = PRICING_TABLE.get(model)
-    if not pricing:
-        raise ValueError(f"Unsupported model for pricing calculation: {model}")
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Calculates execution cost in USD down to micro-cents (6 decimal places)."""
+    input_rate, output_rate = PRICING_TABLE_PER_1M.get(model, (0.15, 0.60))
+    input_cost = (prompt_tokens / 1_000_000.0) * input_rate
+    output_cost = (completion_tokens / 1_000_000.0) * output_rate
+    raw_cost = input_cost + output_cost
 
-    input_cost = (input_tokens / 1_000_000) * pricing["input_per_million"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output_per_million"]
-    return round(input_cost + output_cost, 6)
+    if raw_cost > 0.0:
+        return max(round(raw_cost, 6), 0.000001)
+    return 0.0
